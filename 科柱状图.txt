@@ -1,0 +1,94 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import mannwhitneyu
+from statannotations.Annotator import Annotator
+
+# ==================== 数据准备 ====================
+# 读取科丰度数据
+family_data = pd.read_table("~/work/PRJEB28545/temp/Gene_quant/family_abundance.txt",
+                           index_col=0, header=0)
+
+# 读取分组信息
+group_info = pd.read_table("~/work/PRJEB28545/temp/diversity/group.txt",
+                          header=0)
+group_info.columns = ['sample', 'group']  # 标准化列名
+
+# 提取特定科数据（这里以Drexlerviridae为例）
+target_family = "Drexlerviridae"  # 更改为你要分析的科名
+gratia_data = family_data.loc[[target_family]].T.reset_index()
+gratia_data.columns = ['sample', 'Abundance']
+
+# 合并分组信息
+merged_data = pd.merge(gratia_data, group_info, on='sample')
+
+# ==================== 统计分析 ====================
+# Wilcoxon秩和检验
+hc = merged_data[merged_data['group'] == 'healthy people']['Abundance']
+as_ = merged_data[merged_data['group'] == 'ankylosing spondylitis patient']['Abundance']
+stat, p_value = mannwhitneyu(hc, as_)
+print(f"Wilcoxon检验结果: statistic={stat:.3f}, p-value={p_value:.4f}")
+
+# 计算描述性统计量
+summary_stats = merged_data.groupby('group')['Abundance'].agg(
+    ['mean', 'std', lambda x: np.percentile(x, 25), 
+    lambda x: np.percentile(x, 50), 
+    lambda x: np.percentile(x, 75)]
+)
+summary_stats.columns = ['mean', 'std', 'q1', 'median', 'q3']
+print("\n描述性统计量:")
+print(summary_stats)
+
+# ==================== 绘图设置 ====================
+# 设置颜色
+colors = {
+    "healthy people": "#1f77b4",  # 蓝色
+    "ankylosing spondylitis patient": "#d15b64"  # 红色
+}
+
+# 确定y轴范围
+y_max = merged_data['Abundance'].max() * 1.2
+y_upper = y_max * 0.7
+
+# ==================== 绘制柱状图 ====================
+plt.figure(figsize=(6, 6))
+sns.set_style("white")
+
+# 绘制柱状图
+ax = sns.barplot(x="group", y="Abundance", data=merged_data,
+                estimator=np.mean, ci=95, capsize=0.1,
+                palette=colors, edgecolor="black", linewidth=1)
+
+# 添加散点
+sns.stripplot(x="group", y="Abundance", data=merged_data,
+             color="black", size=5, jitter=0.2, alpha=0.7, ax=ax)
+
+# 添加统计显著性标记
+pval_symbol = "***" if p_value < 0.001 else \
+              "**" if p_value < 0.01 else \
+              "*" if p_value < 0.05 else "ns"
+
+# 使用statannotations库添加显著性标记
+pairs = [("healthy people", "ankylosing spondylitis patient")]
+annotator = Annotator(ax, pairs, data=merged_data, x="group", y="Abundance")
+annotator.configure(text_format="star", loc="inside")
+annotator.set_pvalues([p_value])
+annotator.annotate()
+
+# 设置图形属性
+ax.set_xlabel(target_family, fontsize=12)
+ax.set_ylabel("Relative Abundance", fontsize=12)
+ax.set_ylim(0, y_upper)
+ax.tick_params(axis='both', which='major', labelsize=10)
+
+# 移除图例
+ax.legend().remove()
+
+# 调整布局
+plt.tight_layout()
+
+# 保存图形
+plt.savefig(f"~/work/PRJEB28545/temp/diversity/{target_family}_abundance.pdf",
+           bbox_inches='tight')
+plt.show()

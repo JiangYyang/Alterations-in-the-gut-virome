@@ -1,0 +1,735 @@
+##———————— 1.1 数据下载  ——————————##
+
+#下载 TSV 文件：在ENA项目页面（https://www.ebi.ac.uk/ena/browser/home）下载 TSV 文件。
+#这是一个表格文件，包含该项目中所有 .fastq.gz 文件的相关信息和下载链接。
+
+#查看文件内容：查看前五行内容  PRJEB28545
+head -n 5 your_file.tsv(.txt)
+#your_file.tsv 是下载的文件名称。
+#一般来说，TSV文件中会包含下载链接字段，字段名称通常是 ftp 或 fastq_ftp，链接会以.fastq.gz 结尾。
+#提取链接列：假设链接在 fastq_ftp列，第七列，以下命令会提取 fastq_ftp 列中的下载链接，并将其保存到一个新文件 urls.txt 中：
+cut -f 7 your_file.tsv > urls.txt
+#fastq_ftp 列中包含双端链接，用分号隔开，需进一步拆分，将 urls.txt 中的分号替换为换行符，每行只保留一个 .fastq.gz 链接
+tr ';' '\n' < urls.txt > urls_clean.txt
+#get 批量下载：
+wget -i urls_clean.txt
+#-n 1 表示每次传递一个 URL 给 wget，-P 4 表示同时运行 4 个 wget 进程
+cat urls_clean.txt | xargs -n 1 -P 4 wget
+#或者是使用excel打开TSV文件，手动将用分号隔开的链接分成两列，再使用wget下载
+
+##———————— 1.2 QC  ——————————##
+#激活环境fastp
+conda activate fastp
+#先检查1/2文件是否匹配，如果不匹配就修复文件,后续考虑重新下载对应的fastq文件
+# 在对应pro路径的temp路径下
+input_dir="../seq/PRJEB28545_fastq/"
+output_dir="Standard_clean/" #输出文件夹可自行修改命名
+#start_file="ERR2843589"  # 从指定的文件开始处理
+
+# 创建输出目录
+mkdir -p "$output_dir"
+
+# 遍历目录中所有的 _1.fastq.gz 文件
+for file1 in ${input_dir}*_1.fastq.gz; do
+    # 提取样本 ID（假设文件名格式为 ERRXXXXX_1.fastq.gz）
+    sample_id=$(basename "$file1" "_1.fastq.gz")
+    file2="${input_dir}${sample_id}_2.fastq.gz"
+
+    # 检查是否从指定文件开始
+ #   if [[ "$sample_id" < "$start_file" ]]; then
+ #       echo "Skipping $sample_id..."
+ #       continue
+ #   fi
+
+    # 检查 _1 和 _2 文件是否存在
+    if [[ ! -f "$file2" ]]; then
+        echo "Error: Paired file for $file1 not found! Skipping..."
+        continue
+    fi
+
+    # 检查行数是否匹配
+    lines1=$(zcat "$file1" | wc -l)
+    lines2=$(zcat "$file2" | wc -l)
+    echo "$sample_id: _1 has $lines1 lines, _2 has $lines2 lines."
+
+    if [[ $lines1 -ne $lines2 ]]; then
+        echo "Mismatch detected for $sample_id: _1 has $lines1 lines, _2 has $lines2 lines. Attempting to repair..."
+
+        # 尝试重新配对
+        seqtk mergepe "$file1" "$file2" > "${output_dir}${sample_id}_merged.fastq"
+
+        # 提取配对的序列
+        seqtk seq -1 "${output_dir}${sample_id}_merged.fastq" > "${output_dir}${sample_id}_paired_1.fastq"
+        seqtk seq -2 "${output_dir}${sample_id}_merged.fastq" > "${output_dir}${sample_id}_paired_2.fastq"
+
+        # 压缩修复后的文件
+        gzip -f "${output_dir}${sample_id}_paired_1.fastq"
+        gzip -f "${output_dir}${sample_id}_paired_2.fastq"
+        
+        #修复后的reads数
+        lines1_1=$(zcat "${output_dir}${sample_id}_paired_1.fastq" | wc -l)
+        lines2_1=$(zcat "${output_dir}${sample_id}_paired_2.fastq" | wc -l)
+        echo "$sample_id: _paired_1 has $lines1_1 lines, _paired_2 has $lines2_1 lines."
+
+        # 使用修复后的文件继续
+        file1="${output_dir}${sample_id}_paired_1.fastq.gz"
+        file2="${output_dir}${sample_id}_paired_2.fastq.gz"
+    fi
+
+     # 选择参数
+    fastp_params="-l 90 -q 20 -u 30 -y --trim_poly_g"
+
+
+    # 运行 fastp 进行数据清洗
+    echo "Running fastp for $sample_id..."
+    fastp $fastp_params \
+          -i "$file1" \
+          -o "${output_dir}${sample_id}_clean.1.fastq.gz" \
+          -I "$file2" \
+          -O "${output_dir}${sample_id}_clean.2.fastq.gz" \
+          -w 8 \
+          -h "${output_dir}${sample_id}_sample.html" \
+          -j "${output_dir}${sample_id}_sample.json"
+done
+
+echo "Processing completed."
+
+##———————— 1.3 去宿主  ——————————##
+
+#进行基因组序列比对和处理脚本
+# 输入目录和输出目录
+input_dir="Standard_clean/"
+output_dir="sta_unmapped/"
+ref_genome="/data/home/liang888/LZXgroup/LZXgroup05/ref/GRCh/GRCh38.p14_genomic.fna.gz" #自行下载对比数据集
+
+# 确保输出目录存在
+# mkdir -p "$output_dir"
+
+# 构建 Bowtie2 索引（只需运行一次）
+if [[ ! -f "${output_dir}ref_bowtie2_index.1.bt2" ]]; then
+    bowtie2-build --threads 8 "${ref_genome}" "${output_dir}ref_bowtie2_index"
+fi
+
+# 批量处理每对双端文件
+for sample in ${input_dir}ERR*_clean.1.fastq.gz; do
+    sample_id=$(basename "$sample" "_clean.1.fastq.gz")
+    file1="${input_dir}${sample_id}_clean.1.fastq.gz"
+    file2="${input_dir}${sample_id}_clean.2.fastq.gz"
+
+    # 检查文件是否存在
+    if [[ ! -f "$file1" || ! -f "$file2" ]]; then
+        echo "Error: Paired files for $sample_id not found! Skipping..."
+        continue
+    fi
+
+    # 输出路径
+    sam_file="${output_dir}${sample_id}.sam"
+    log_file="${output_dir}${sample_id}.mapping.log"
+    unmap_1="${output_dir}${sample_id}.unmap.1.fastq.gz"
+    unmap_2="${output_dir}${sample_id}.unmap.2.fastq.gz"
+    unmap_single="${output_dir}${sample_id}.unmap.single.fastq.gz"
+
+    # 运行 Bowtie2
+    echo "Running Bowtie2 for $sample_id..."
+    bowtie2 --threads 6 -x "${output_dir}ref_bowtie2_index" -1 "$file1" -2 "$file2" -S "$sam_file" 2>"$log_file"
+
+    # 检查 .sam 文件是否生成
+    if [[ ! -f "$sam_file" ]]; then
+        echo "Error: SAM file not generated for $sample_id! Skipping..."
+        continue
+    fi
+
+    # 提取未比对序列
+    echo "Extracting unmapped reads for $sample_id..."
+    samtools fastq -@ 8 -f 4 "$sam_file" -1 "$unmap_1" -2 "$unmap_2" -s "$unmap_single"
+
+    # 清理中间文件（可选）
+    rm -f "$sam_file"
+done
+
+echo "Processing completed."
+
+##———————— 1.4 megahit组装  ——————————##
+#转换环境
+conda deactivate
+conda activate meta
+#de novo 组装，生成final.contigs.fa结果文件
+# 输入和输出目录
+input_dir="sta_unmapped/"
+output_dir="sta_megahit/"
+
+# 遍历目录中所有的 _1.fastq.gz 文件
+for file1 in ${input_dir}ERR*.unmap.1.fastq.gz; do
+    # 提取样本 ID（假设文件名格式为 ERRXXXXX.unmap.1.fastq.gz）
+    sample_id=$(basename "$file1" ".unmap.1.fastq.gz")
+    file2="${input_dir}${sample_id}.unmap.2.fastq.gz"
+
+    # 检查 _1 和 _2 文件是否存在
+    if [[ ! -f "$file2" ]]; then
+        echo "Error: Paired file for $file1 not found! Skipping..."
+        continue
+    fi
+
+    # 运行 MEGAHIT 进行组装
+    echo "Running MEGAHIT for $sample_id..."
+    megahit -1 "$file1" \
+            -2 "$file2" \
+            -o "${output_dir}/${sample_id}" \ #注意输出文件的目录不能提前建立，必须保证这个代码运行前，输出目录不存在
+            1> "${output_dir}/${sample_id}_log.txt" \
+            2> "${output_dir}/${sample_id}_err.txt"
+done
+
+echo "Processing completed."
+
+##———————— 1.5 checkv评估筛选1  ——————————##
+#转换环境
+conda deactivate
+conda activate checkv
+#筛选病毒contigs
+# 条件1: 移除真核生物基因数量 > 50% 的 contigs
+# 条件2: 移除真核生物基因数量 > 病毒基因数量的10倍的 contigs
+#diamond blastx --threads 8； checkv -t 12加速
+#不加-t 12，checkv一个ERR文件运行6h；加-t 12，大约1-1.2h
+# 输入目录，包含所有 ERR 文件夹
+input_dir="sta_megahit/"
+# 输出目录，包含所有 ERR 文件夹的过滤结果
+output_dir_base="sta_filter/"
+checkv_db="/data/home/liang888/LZXgroup/LZXgroup05/ref/checkv-db/checkv-db-v1.5/"
+
+# 遍历输入目录中的所有 ERR 文件夹
+for err_dir in "$input_dir"ERR*/; do
+    # 检查目录是否真实存在
+    if [[ -d "$err_dir" ]]; then
+        # 提取样本 ID（即 ERR 文件夹名）
+        sample_id=$(basename "$err_dir")
+        
+        #检查是否是指定起始编号或更高的编号
+        #if [[ "$sample_id" < "ERR2843606" ]]; then
+        #echo "Skipping $sample_id, as it is before the starting ID ERR2843606."
+        #continue
+    #fi
+
+        # 定义 CheckV 的输出路径
+        output_dir="${output_dir_base}${sample_id}"
+        mkdir -p "$output_dir" && echo "Output directory created successfully for $sample_id"
+
+        # 定义 contigs 文件路径
+        contig_file="$err_dir/final.contigs.fa"
+
+        if [[ ! -f "$contig_file" ]]; then
+            echo "Contigs file not found for $sample_id. Skipping..."
+            continue
+        fi
+
+        echo "Running DIAMOND blastx for $sample_id..."
+        # 使用 DIAMOND blastx 对 contigs 进行处理
+        diamond_output="${output_dir}/diamond_output.m8"
+        diamond blastx \
+            -d "${checkv_db}/genome_db/checkv_reps.dmnd" \
+            -q "$contig_file" \
+            -o "$diamond_output" \
+            --threads 8
+
+        # 检查 DIAMOND 是否运行成功
+        if [[ ! -s "$diamond_output" ]]; then
+            echo "Error: DIAMOND failed for $sample_id. Skipping..."
+            continue
+        fi
+
+        echo "Running CheckV for $sample_id..."
+        # 运行 CheckV 评估 contigs
+        checkv end_to_end "$contig_file" "$output_dir" -d "$checkv_db" -t 12
+
+        # CheckV 输出的 contig 信息表格路径
+        checkv_quality_file="${output_dir}/quality_summary.tsv"
+
+        # 筛选 contigs：
+        # 条件1: 移除真核生物基因数量 > 50% 的 contigs
+        # 条件2: 移除真核生物基因数量 > 病毒基因数量的10倍的 contigs
+        # 条件3: contig_length > 5000 bp
+        filtered_contigs="${output_dir}/filtered_contigs.fa"
+
+        echo "Filtering contigs for $sample_id..."
+
+        awk -F'\t' '
+        BEGIN { OFS="\t" }
+        NR==1 { next }  # 跳过表头
+        {
+            contig_length = $2;      # 第二列是contig长度（单位bp）
+            prok_genes=$7;  # 真核生物（细菌+古菌）基因数量
+            total_genes=$5; # 总基因数量
+            viral_genes=$6; # 病毒基因数量
+
+            # 条件筛选
+            if ((contig_length) >= 5000 && (prok_genes <= total_genes / 2) && (prok_genes <= 10 * viral_genes)) {
+                print $1  # 保留 contig 的 ID
+            }
+        }
+        ' "$checkv_quality_file" > "${output_dir}/keep_contigs.list"
+
+        # 从原始 contigs 中提取符合条件的 contigs
+        seqtk subseq "$contig_file" "${output_dir}/keep_contigs.list" > "$filtered_contigs"
+
+        echo "Filtered contigs for $sample_id saved to: $filtered_contigs"
+    else
+        echo "Directory $err_dir not found. Skipping..."
+    fi
+done
+
+echo "All samples processed successfully."
+
+##———————— 1.6 deepvirfinder和VIBRANT筛选2  ——————————##
+#转换环境
+conda deactivate
+conda activate dvf
+# 输入和输出路径
+input_dir="sta_filter/"
+output_dir_base="sta_viral/"
+checkv_db="/data/home/liang888/LZXgroup/LZXgroup05/ref/checkv-db/checkv-db-v1.5/"
+deepvirfinder_dir="/data/home/liang888/LZXgroup/LZXgroup05/tools/DeepVirFinder/"
+vibrant_dir="/data/home/liang888/LZXgroup/LZXgroup05/tools/VIBRANT/"
+# 创建输出目录
+mkdir -p "$output_dir_base"
+
+# 遍历每个样本的 filtered_contigs.fa 文件
+for contig_file in "${input_dir}"*/filtered_contigs.fa; do
+    echo "Contig file: $contig_file"  # 调试输出
+
+    # 检查文件是否存在
+    if [[ ! -f "$contig_file" ]]; then
+        echo "No contig file found at $contig_file. Skipping..."
+        continue
+    fi
+
+    # 提取样本 ID（从父目录提取）
+    sample_id=$(basename "$(dirname "$contig_file")")
+    echo "Processing sample: $sample_id"
+    output_dir="${output_dir_base}/${sample_id}"
+    mkdir -p "$output_dir" && echo "Output directory created successfully for $sample_id"
+
+    # 定义中间文件路径
+    checkv_output="${output_dir}/${sample_id}_checkv"
+    deepvirfinder_output="${output_dir}/${sample_id}_deepvirfinder"
+    vibrant_output="${output_dir}/${sample_id}_vibrant"
+    combined_contigs="${output_dir}/${sample_id}_viral_contigs.fa"
+
+    # ----------------- 1. CheckV 条件 -----------------
+    echo "Running CheckV for $sample_id..."
+    mkdir -p "$checkv_output"
+    # 筛选至少有一个病毒基因；病毒基因数 > 原核基因数的 contigs；completeness≥50%
+    awk -F'\t' 'NR>1 && $6 >= 1 && $6 > $7 && $10 >= 50 {print $1}' "${input_dir}${sample_id}/quality_summary.tsv" > "${checkv_output}/checkv_viral.list"
+
+    # ----------------- 2. DeepVirFinder 条件 -----------------
+    echo "Running DeepVirFinder for $sample_id..."
+    mkdir -p "$deepvirfinder_output"
+    python ${deepvirfinder_dir}/dvf.py -i "$contig_file" -o "$deepvirfinder_output" -c 15
+
+    # 筛选 score > 0.90 且 p-value < 0.01 的 contigs
+    #awk -F'\t' '$2 > 0.90 && $3 < 0.01 {print $1}' ${deepvirfinder_output}/*gt1bp_dvfpred.txt > ${deepvirfinder_output}/dvf_viral.list
+    awk -F'\t' '$3 > 0.90 && $4 < 0.01 {split($1, a, " "); print a[1]}' ${deepvirfinder_output}/*gt1bp_dvfpred.txt > ${deepvirfinder_output}/dvf_viral.list
+    
+    # ----------------- 3. VIBRANT 条件 -----------------
+    echo "Running VIBRANT for $sample_id..."
+    mkdir -p "$vibrant_output"
+    python ${vibrant_dir}/VIBRANT_run.py -i "$contig_file" -folder "$vibrant_output" -t 15
+
+    # 提取 VIBRANT 识别的病毒 contigs
+    #cat ${vibrant_output}/VIBRANT_filtered_contigs/VIBRANT_phages*/*phages_combined.txt > ${vibrant_output}/vibrant_viral.list
+    cat ${vibrant_output}/VIBRANT_filtered_contigs/VIBRANT_phages*/*phages_combined.txt | awk '{split($1, a, " "); print a[1]}' > ${vibrant_output}/vibrant_viral.list
+
+    # ----------------- 4. 合并所有条件 -----------------
+    echo "Combining results for $sample_id..."
+    cat "${checkv_output}/checkv_viral.list" \
+        "${deepvirfinder_output}/dvf_viral.list" \
+        "${vibrant_output}/vibrant_viral.list" | sort | uniq > "${output_dir}/${sample_id}_all_viral.list"
+
+    # ----------------- 5. 提取最终的病毒 contigs -----------------
+    echo "Extracting viral contigs for $sample_id..."
+    seqtk subseq "$contig_file" "${output_dir}/${sample_id}_all_viral.list" > "$combined_contigs"
+
+    echo "Viral contigs for $sample_id saved to: $combined_contigs"
+done
+
+echo "Processing completed!"
+
+
+##———————— 1.7 BUSCO评估，保存到sta_busco/  ——————————##
+conda deactivate
+#conda create -n busco -c conda-forge -c bioconda busco=5.8.2
+conda activate busco 
+#在对应project的temp路径下
+# 输入和输出路径
+input_dir="sta_viral/"
+output_dir_base="sta_busco/"
+ref_dir="sta_filter/"
+busco_db="/data/home/liang888/LZXgroup/LZXgroup05/ref/busco_downloads/bacteria_odb12/"
+star_file="ERR2843680"  # 从指定的文件开始处理
+
+# 遍历每个样本的 filtered_contigs.fa 文件
+for contig_file in "${input_dir}"*/*viral_contigs.fa; do
+echo "Contig file: $contig_file"  # 调试输出
+
+# 检查文件是否存在
+if [[ ! -f "$contig_file" ]]; then
+echo "No contig file found at $contig_file. Skipping..."
+continue
+fi
+
+# 提取样本 ID（从父目录提取）
+sample_id=$(basename "$(dirname "$contig_file")")
+echo "Processing sample: $sample_id"
+
+# 检查是否从指定文件开始
+if [[ "$sample_id" < "$start_file" ]]; then
+  echo "Skipping $sample_id..."
+  continue
+fi
+
+#输出路径
+output_dir="${output_dir_base}/${sample_id}"
+mkdir -p "$output_dir" && echo "Output directory created successfully for $sample_id"
+
+# ----------------- busco 筛选 -----------------
+echo "Running busco for $sample_id..."
+busco -i "$contig_file" -c 10 -o "$output_dir" -m geno -l $busco_db  --offline  -f
+done
+
+echo "Processing completed!"
+
+##———————— 1.8 去除busco ratio > 5%，保存到busco_viral/  ——————————##
+#使用R提取quality_summary.tsv中的contig_length，写入到full_table.tsv文件文件中，并计算busco ratio
+#运行~/work/PRJEB28545/temp/sta_busco/busco.ratio.R
+#3594表格文件有问题，修改两句
+full_table_path <- file.path(sta_busco_dir, err_id, "run_bacteria_odb12", "ERR3594.csv")
+full_table <- read.csv(full_table_path, header = TRUE, stringsAsFactors = FALSE, fill = TRUE)
+
+
+#去除busco ratio > 5%的contigs，保存到busco_viral/文件夹下
+sta_busco_dir="sta_busco"
+sta_viral_dir="sta_viral"
+output_dir="busco_viral"
+
+# 遍历 sta_busco/ 目录中的所有 ERR 文件夹
+for err_dir in "$sta_busco_dir"/ERR*; do
+    # 获取当前 ERR 文件夹的名称
+    err_id=$(basename "$err_dir")
+
+    # 定义文件路径
+    full_with_length_file="$err_dir/full_with_length.tsv"
+    viral_contigs_file="$sta_viral_dir/$err_id/${err_id}_viral_contigs.fa"
+    all_viral_list="$sta_viral_dir/$err_id/${err_id}_all_viral.list"
+    rm_list="$output_dir/$err_id/rm.list"
+    output_file="$output_dir/$err_id/busco_viral.fa"
+
+    # 检查必需的输入文件是否存在
+    if [[ -f "$full_with_length_file" && -f "$viral_contigs_file" && -f "$all_viral_list" ]]; then
+        # 创建输出目录
+        mkdir -p "$output_dir/$err_id"
+
+        # 从 full_with_length.tsv 筛选 ratio > 0.05 的行并提取 Sequence
+        awk -F'\t' '$10 > 0.05 {print $3}' "$full_with_length_file" > "$rm_list.temp"
+        awk 'NF > 0 && $1 != "Sequence"' "$rm_list.temp" > "$rm_list"
+        
+
+        # 从 all_viral_list 中排除 rm.list 中的 contig
+        grep -F -v -f "$rm_list" "$all_viral_list" > "$output_dir/$err_id/keep.list"
+
+        # 使用 seqtk 提取需要保留的 contig
+        seqtk subseq "$viral_contigs_file" "$output_dir/$err_id/keep.list" > "$output_file"
+
+        # 清理临时文件
+        rm "$output_dir/$err_id/keep.list" "$rm_list.temp"
+
+        echo "Processed $err_id: Output saved to $output_file"
+    else
+        echo "Skipping $err_id: Missing input files"
+    fi
+done
+
+
+##———————— 2. 聚类和分类注释  ——————————##
+##———————— 2.1 BLASTN 进行两两比对聚类  ——————————##
+# 进入目标目录
+cd ~/work/PRJEB28545/temp/busco_viral
+# 合并所有 busco_viral.fa 文件，生成combined_viral.fa用于聚类
+cat ERR*/busco_viral.fa > combined_viral.fa
+
+#9.1.1将 combined_viral.fa 文件转换为 BLASTN 数据库格式，都以combined_viral_db开头
+makeblastdb -in ~/work/PRJEB28545/temp/busco_viral/combined_viral.fa \
+  -dbtype nucl \
+  -out ~/work/PRJEB28545/temp/blastn_cluster/combined_viral_db
+#temp目录下
+cd  ~/work/PRJEB28545/temp
+#运行 BLASTN 进行两两比对，结果文件为blastn_results.tsv
+seq_list=($(ls busco_viral/*.fa))  # 获取所有查询文件
+time parallel -j 4 \
+  'blastn -db blastn_cluster/combined_viral_db \
+  -query {} -out blastn_cluster/blastn_results.tsv \
+  -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore" \
+  -perc_identity 95 -qcov_hsp_perc 70' ::: "${seq_list[@]}"
+
+#2.1.2解析聚类结果并提取代表序列
+#运行~/work/PRJEB28545/temp/blastn_cluster/提取代表序列.R，聚类结果文件：vOTU_clusters；代表性序列文件：vOTU_rep_seqs.fasta
+
+##———————— 2.2 prodigal预测蛋白序列  ——————————##
+#结果文件为，预测编码蛋白的核苷酸序列pre_gene.fa；预测的氨基酸序列pre_proteins.faa
+prodigal -i blastn_cluster/vOTU_rep_seqs.fasta -o annotation/prodigal_output.txt -d annotation/pre_gene.fa -a annotation/pre_proteins.faa -p meta
+##———————— 2.3 mmseqs对蛋白聚类  ——————————##
+#聚类核酸序列
+#mmseqs easy-linclust annotation/pre_gene.fa annotation/gene_cluster tmp --min-seq-id 0.9 --cov-mode 1 -c 0.8 --kmer-per-seq 80
+#聚类蛋白序列，结果文件为prote_cluster开头，会包括聚类代表序列prote_cluster_rep_seq.fasta
+mmseqs easy-linclust annotation/pre_proteins.faa annotation/prote_cluster tmp --min-seq-id 0.9 --cov-mode 1 -c 0.8 --kmer-per-seq 80
+
+##———————— 2.4 diamond蛋白分类注释  ——————————##
+####——————2.4.1完善ref数据库
+#下载virus-host数据库
+wget -c https://www.genome.jp/ftp/db/virushostdb/virushostdb.cds.faa.gz -O ~/work/ref/virus-host/virushostdb.cds.faa.gz
+gunzip ~/work/ref/virus-host/virushostdb.cds.faa.gz
+time diamond makedb \
+  --in ~/work/ref/virus-host/virushostdb.cds.faa \
+  --db ~/work/ref/virus-host/virushostdb.dmnd \
+  --threads 12
+  
+#完善Flandersviridae Quimbyviridae Gratiaviridae蛋白序列
+#参考文献Benler, S. et al. Thousands of previously unknown phages discovered in whole-community human  gut metagenomes
+wget -r -nH --cut-dirs=4 -P ~/work/PRJEB28545/ref_db ftp://ftp.ncbi.nih.gov/pub/yutinn/benler_2020/gut_phages/
+#构建包含分类学信息的 DIAMOND 数据库，将下载的补充数据库转换为 DIAMOND 格式，添加分类学信息
+time diamond makedb \
+  --in ~/work/PRJEB28545/ref_db/represent_prot/add_viral.faa \
+  --db ~/work/PRJEB28545/ref_db/add_viral.dmnd \
+  --threads 12
+
+
+####——————2.4.2使用数据库作为对照进行比对注释
+#1. 使用 DIAMOND 进行注释，对 MMseqs2 聚类后的代表性序列（cluster_result_rep_seq.fasta）进行注释
+conda deactivate
+conda activate meta
+cd ~/work/PRJEB28545/temp
+#使用nr库注释
+time diamond blastp \
+  --query  annotation/prote_cluster_rep_seq.fasta \
+  --db ~/work/ref/virus-host/virushostdb.dmnd \
+  --out try/diamond_viralhost_results.tsv \
+  --outfmt 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore staxids \
+  --id 30 \
+  --query-cover 50 \
+  --min-score 50 \
+  --max-target-seqs 10 \
+  --threads 12
+  # --id 30 表示只保留相似性大于等于30% 的比对结果
+
+#使用文中附加病毒序列进行注释
+time diamond blastp \
+  --query  annotation/prote_cluster_rep_seq.fasta \
+  --db ~/work/PRJEB28545/ref_db/add_viral.dmnd \
+  --out anno_nr_viral/diamond_addv_results.tsv \
+  --outfmt 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore \
+  --id 30 \
+  --query-cover 50 \
+  --min-score 50 \
+  --max-target-seqs 10 \
+  --threads 10
+  # --id 30 表示只保留相似性大于等于30% 的比对结果
+  
+#2. 运行"~/work/PRJEB28545/temp/anno_nr_viral/合并筛选.R"，（1）处理diamond_addv_results.tsv结果，把OHJN01001272.1_7转变为OHJN01001272.1
+#（2）合并diamond注释的两个数据集结果，结果文件merged_diamond_results.tsv，列名sseqid改为accession.version
+#（3）筛选出bitscore分数最高的qseqid-accession.version，结果文件diamond_filtered.tsv，只保留qseqid，accession.version，下面手动注释taxid
+Rscript ~/work/PRJEB28545/temp/anno_nr_viral/合并筛选.R
+
+#3. taxonkit获得AC 2 taxid
+cd ~/work/PRJEB28545/temp
+#taxid_AC_物种分类映射准备（构建不同的子库，这里构建病毒库映射）
+taxonkit list -j 4 --ids 10239 --indent "" > ~/work/PRJEB28545/temp/anno_nr_viral/NCBI_Main.taxid.virus.txt
+
+#所有病毒的taxid与界门纲目科属种分类信息对应
+less anno_viral/anno_nr_viral/NCBI_Main.taxid.virus.txt \
+  | taxonkit reformat -I 1 -r Unassigned -f "{k}\t{p}\t{c}\t{o}\t{f}\t{g}\t{s}\t{t}" \
+  | sed '1i\taxid\tKingdom\tPhylum\tClass\tOrder\tFamily\tGenus\tSpecies\tStrain' \
+  > anno_nr_viral/NCBI_Main.taxid.virus_new.txt
+ 
+#把taxid与AC对应起来，制作成病毒参照表，包含taxid,accession.version,Kingdom,Phylum,Class,Order,Family,Genus,Species列（一个半小时）
+####————————
+#提取病毒 taxid 列表（仅需运行一次）
+cut -f1 anno_nr_viral/NCBI_Main.taxid.virus_new.txt > virus_taxids.txt
+
+#提取列名并保存到变量
+header="taxid\taccession.version\tKingdom\tPhylum\tClass\tOrder\tFamily\tGenus\tSpecies"
+
+#使用 awk 快速筛选 prot.accession2taxid.FULL 中的目标行
+awk 'BEGIN {FS=OFS="\t"}
+    NR==FNR {taxid[$1]=1; next}
+    $2 in taxid {print $2, $1}' \
+    virus_taxids.txt \
+    ~/work/ref/diamond_nr/prot.accession2taxid.FULL > filtered_accessions.tsv
+
+#排序并关联分类信息
+tail -n +2 anno_nr_viral/NCBI_Main.taxid.virus_new.txt | sort -k1,1 > sorted_taxinfo.tsv
+sort -k1,1 filtered_accessions.tsv > sorted_accessions.tsv
+
+#使用 join 合并数据，并添加列名
+{
+    # 输出表头
+    echo -e "$header"
+    # 进行 join 并按需提取列
+    join -t $'\t' -1 1 -2 1 sorted_accessions.tsv sorted_taxinfo.tsv \
+        | awk 'BEGIN {FS=OFS="\t"} {print $1, $2, $3, $4, $5, $6, $7, $8, $9}'
+} > anno_nr_viral/NCBI_taxid_AC.virus.txt
+
+#清理临时文件
+rm virus_taxids.txt filtered_accessions.tsv sorted_accessions.tsv sorted_taxinfo.tsv
+####————————
+
+# 4. 合并ncbi和文中病毒序列的总映射
+file_large="anno_nr_viral/NCBI_taxid_AC.virus.txt"
+file_small="anno_nr_viral/addviral_taxid_AC.txt"
+output_file="anno_nr_viral/all_taxid_AC.virus.txt"
+
+#提取并保存列名
+header="taxid\taccession.version\tKingdom\tPhylum\tClass\tOrder\tFamily\tGenus\tSpecies"
+echo -e "$header" > "$output_file"
+
+#合并去除各文件的表头并追加到输出文件
+tail -n +2 "$file_large" >> "$output_file"
+tail -n +2 "$file_small" >> "$output_file"
+
+echo "合并完成，结果已保存到: $output_file"
+
+#5. 把qseqid与物种信息连接起来
+# 设置输入和输出文件路径
+ncbi_file="anno_nr_viral/all_taxid_AC.virus.txt"
+diamond_file="anno_nr_viral/diamond_filtered.tsv"
+output_file="anno_nr_viral/viral_lineage.tsv"
+
+# 按照 accession.version 进行合并并输出需要的列
+csvtk join -t -f "accession.version" "$diamond_file" "$ncbi_file" \
+    | csvtk cut -t -f "qseqid,taxid,accession.version,Kingdom,Phylum,Class,Order,Family,Genus,Species" \
+    >> "$output_file"
+
+
+#6. 运行 vOTU2分类信息.py，将翻译成蛋白质的qseqid(k141_147470_11)按照科注释数量最多的taxid，转化为代表序列(k141_147470)对应的taxid,结果文件parent_lineage.tsv
+python ~/work/PRJEB28545/temp/anno_nr_viral/vOTU2分类信息.py
+
+####———————— 4. 计算vOTU的相对丰度画物种丰度图  ——————————####
+conda deactivate 
+conda activate fastp
+cd ~/work/PRJEB28545/temp
+##———————— 4.1 bowtie2比对获得每个vOTU的mapped reads数  ——————————##
+#或者直接运行
+#nohup bash "/data/home/liang888/LZXgroup/LZXgroup05/PRJEB28545/temp/Gene_quant/Calculate_abundance_parallel.sh" > \
+#  "/data/home/liang888/LZXgroup/LZXgroup05/PRJEB28545/temp/Gene_quant/Calculate_abundance_parallel.log" 2>&1 &
+
+####————————以下是Calculate_abundance_parallel.sh具体内容————————######
+#构建 bowtie2 索引，生成的索引文件会以 count为前缀，保存在同一目录下，只需要构建一次
+#bowtie2-build ~/work/PRJEB28545/temp/blastn_cluster/vOTU_rep_seqs.fasta ~/work/PRJEB28545/temp/Gene_quant/count
+
+# 定义路径
+input_dir="$HOME/work/PRJEB28545/temp/sta_unmapped"
+index_prefix="$HOME/work/PRJEB28545/temp/Gene_quant/count"
+output_dir="$HOME/work/PRJEB28545/temp/Gene_quant/bowtie2_results"
+
+#使用parallel来并行处理文件
+# 定义一个函数来处理单个样本
+process_sample() {
+    sample_name=$1
+    input_dir=$2
+    index_prefix=$3
+    output_dir=$4
+    
+    echo "Processing sample: $sample_name"
+    
+    # 定义输入文件和输出文件
+    input_1="$input_dir/${sample_name}.unmap.1.fastq.gz"
+    input_2="$input_dir/${sample_name}.unmap.2.fastq.gz"
+    output_sam="$output_dir/${sample_name}.sam"
+    output_bam="$output_dir/${sample_name}.bam"
+    output_sorted_bam="$output_dir/${sample_name}.sorted.bam"
+    output_idxstats="$output_dir/${sample_name}.idxstats.txt"
+    output_abundance="$output_dir/${sample_name}.relative_abundance.txt"
+    
+    # 运行 bowtie2 比对
+    echo "Running bowtie2 for $sample_name..."
+    bowtie2 --end-to-end --fast --no-unal \
+        -x "$index_prefix" \
+        -1 "$input_1" \
+        -2 "$input_2" \
+        -S "$output_sam" \
+        --threads 4  # 每个 bowtie2 任务使用 4 个线程
+    
+    # 将 SAM 转换为 BAM 并排序
+    echo "Converting SAM to BAM and sorting..."
+    samtools view -b -o "$output_bam" "$output_sam"
+    samtools sort "$output_bam" -o "$output_sorted_bam"
+    
+    # 计算每个 vOTU 的 reads 数
+    echo "Calculating idxstats for $sample_name..."
+    samtools index "$output_sorted_bam"
+    samtools idxstats "$output_sorted_bam" > "$output_idxstats"
+    
+    # 计算相对丰度（使用 R 脚本）
+    echo "Calculating relative abundance for $sample_name..."
+    Rscript -e "
+    library(dplyr)
+    # 读取 idxstats 文件
+    idxstats_file <- '$output_idxstats'
+    output_file <- '$output_abundance'
+
+    # 读取数据
+    data <- read.table(idxstats_file, header = FALSE, col.names = c('vOTU_ID', 'length', 'mapped_reads', 'unmapped_reads'), sep = '\t', quote = "")
+    
+    # 计算相对丰度，跳过 vOTU_ID, length, unmapped_reads 列
+    relative_abundance <- data %>%
+      mutate(across(-c(vOTU_ID, length, unmapped_reads), ~ round(.x / sum(.x), 10), .names = 'relative_abundance'))
+
+    # 保存结果
+    write.table(relative_abundance, output_file, sep = '\t', row.names = FALSE, quote = FALSE)
+  
+    # 打印成功信息
+    cat('相对丰度计算结果已保存到:', output_file, '\n')
+    "
+    
+    # 清理中间文件
+    echo "remove temp files for $sample_name"
+    rm -f "$output_sam" "$output_bam"  "$output_sorted_bam"
+
+    echo "Finished processing $sample_name"
+    echo "----------------------------------------"
+}
+
+# 导出函数，以便 parallel 可以调用
+export -f process_sample
+
+# 获取所有样本名称
+sample_names=$(basename -s .unmap.1.fastq.gz "$input_dir"/ERR*.unmap.1.fastq.gz)
+
+# 使用 parallel 并行处理样本
+echo "Starting parallel processing..."
+/data/home/LZXgroup/LZXgroup05/miniconda3/bin/parallel -j 4 process_sample {} "$input_dir" "$index_prefix" "$output_dir" ::: $sample_names
+
+
+#####——————如果要指定开始处理文件编码，请运行以下程序——————####
+# 筛选从 ERR2843570 开始的样本
+#filtered_sample_names=$(echo "$sample_names" | awk '{if ($1 >= "ERR2843570") print $1}')
+# 使用 parallel 并行处理样本
+#echo "Starting parallel processing..."
+#/data/home/LZXgroup/LZXgroup05/miniconda3/bin/parallel -j 4 process_sample {} "$input_dir" "$index_prefix" "$output_dir" ::: $filtered_sample_names
+
+echo "批量处理完成！"
+####————————以上是Calculate_abundance_parallel.sh具体内容————————######
+
+##———————— 4.2 合并所有样本的vOTU的相对丰度  ——————————##
+Rscript ~/work/PRJEB28545/temp/Gene_quant/merge_abundance.R #结果文件为merged_relative_abundance.txt
+##———————— 4.3 绘制帕累托图以及选择前xx条votu绘图（可选）  ——————————##
+python ~/work/PRJEB28545/temp/Gene_quant/pareto_getpro.py 
+##———————— 4.4 科水平相对丰度绘图  ——————————##
+Rscript ~/work/PRJEB28545/temp/Gene_quant/科丰度绘图.R  #把前xx个votu与科对应，绘制科水平物种堆叠图
+  
+####———————— 5. 病毒多样性  ——————————####
+####绘制PCOA图#####
+PCOA.txt
+
+####绘制α多样性图，香农、Simpson指数#####
+α-diversity.txt
+
+####科柱状图，选择有显著差异的科#####
+科柱状图.txt  #显著科结果见科柱状图文件夹
+

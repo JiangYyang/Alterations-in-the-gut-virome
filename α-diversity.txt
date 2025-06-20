@@ -1,0 +1,130 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from skbio.diversity import alpha_diversity
+from scipy.stats import mannwhitneyu
+import matplotlib.patches as mpatches
+
+# ==================== 第一部分：计算多样性指数 ====================
+# 读取OTU表格（行是OTU，列是样本）
+votu_data = pd.read_table("~/work/PRJEB28545/temp/diversity/pro_votu_abundance.txt",
+                         index_col=0, header=0)
+
+# 转置数据（skbio要求样本在行，OTU在列）
+t_votu = votu_data.T
+
+# 计算多样性指数
+shannon = alpha_diversity('shannon', t_votu.values, ids=t_votu.index)
+simpson = alpha_diversity('simpson', t_votu.values, ids=t_votu.index)
+
+div_index = pd.DataFrame({
+    'Sample': t_votu.index,
+    'Shannon': shannon,
+    'Simpson': simpson
+})
+
+# ==================== 第二部分：合并分组信息 ====================
+group_info = pd.read_table("~/work/PRJEB28545/temp/diversity/group.txt",
+                          header=0)
+group_info.columns = ['Sample', 'group']  # 标准化列名
+
+# 合并数据
+merged_div = pd.merge(div_index, group_info, on='Sample')
+
+# 转换成长格式
+melted_div = pd.melt(merged_div,
+                    id_vars=['Sample', 'group'],
+                    value_vars=['Shannon', 'Simpson'],
+                    var_name='Index',
+                    value_name='Value')
+
+# 执行统计检验
+print("Shannon指数检验结果:")
+shannon_data = melted_div[melted_div['Index'] == 'Shannon']
+print(mannwhitneyu(
+    shannon_data.loc[shannon_data['group'] == 'healthy people', 'Value'],
+    shannon_data.loc[shannon_data['group'] == 'ankylosing spondylitis patient', 'Value']
+))
+
+print("\nSimpson指数检验结果:")
+simpson_data = melted_div[melted_div['Index'] == 'Simpson']
+print(mannwhitneyu(
+    simpson_data.loc[simpson_data['group'] == 'healthy people', 'Value'],
+    simpson_data.loc[simpson_data['group'] == 'ankylosing spondylitis patient', 'Value']
+))
+
+# ==================== 第三部分：绘制双指标箱线图 ====================
+# 分组重命名和排序
+melted_div['group'] = melted_div['group'].map({
+    'healthy people': 'HC',
+    'ankylosing spondylitis patient': 'AS'
+})
+
+# 定义颜色方案
+group_colors = {'HC': '#73bbaf', 'AS': '#d15b64'}
+
+plt.figure(figsize=(10, 6))
+sns.set_style('white')
+sns.set_context('notebook', font_scale=1.2)
+
+# 创建箱线图
+ax = sns.boxplot(x='group', y='Value', hue='group', data=melted_div,
+                palette=group_colors, width=0.6, fliersize=0)
+
+# 添加散点
+sns.stripplot(x='group', y='Value', hue='group', data=melted_div,
+              palette=group_colors, dodge=True, jitter=0.2, size=4,
+              linewidth=0.5, edgecolor='black', ax=ax)
+
+# 添加统计显著性标记
+def add_significance(ax, x1, x2, y, pvalue):
+    if pvalue < 0.001:
+        symbol = '***'
+    elif pvalue < 0.01:
+        symbol = '**'
+    elif pvalue < 0.05:
+        symbol = '*'
+    else:
+        symbol = 'ns'
+    
+    ax.plot([x1, x1, x2, x2], [y, y+0.1, y+0.1, y], lw=1.5, color='black')
+    ax.text((x1+x2)*0.5, y+0.15, symbol, ha='center', va='bottom')
+
+# 获取每个指标的y轴范围用于定位显著性标记
+for i, index in enumerate(['Shannon', 'Simpson']):
+    subset = melted_div[melted_div['Index'] == index]
+    y_max = subset['Value'].max()
+    
+    # 计算p值
+    hc = subset[subset['group'] == 'HC']['Value']
+    as_ = subset[subset['group'] == 'AS']['Value']
+    _, p = mannwhitneyu(hc, as_)
+    
+    # 添加显著性标记
+    add_significance(ax, i*2-0.2, i*2+0.2, y_max*1.05, p)
+
+# 分面显示
+ax = sns.FacetGrid(melted_div, col='Index', sharey=False, height=6, aspect=0.8)
+ax.map_dataframe(sns.boxplot, x='group', y='Value', hue='group',
+                palette=group_colors, width=0.6, fliersize=0)
+ax.map_dataframe(sns.stripplot, x='group', y='Value', hue='group',
+                palette=group_colors, dodge=True, jitter=0.2, size=4,
+                linewidth=0.5, edgecolor='black')
+
+# 设置标题和标签
+ax.set_axis_labels('Experimental Group', 'Diversity Index Value')
+ax.fig.suptitle('Alpha Diversity Comparison Between Groups', y=1.05)
+ax.set_titles(col_template="{col_name}")
+
+# 调整图例
+handles = [mpatches.Patch(color=group_colors[k], label=k) for k in group_colors]
+ax.add_legend(handles=handles, title='Group')
+
+# 调整布局
+plt.tight_layout()
+
+# 保存图形
+plt.savefig("~/work/PRJEB28545/temp/diversity/alpha_diversity_boxplot.pdf",
+           bbox_inches='tight')
+plt.show()

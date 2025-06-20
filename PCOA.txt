@@ -1,0 +1,112 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from skbio.stats.ordination import pcoa
+from skbio.diversity import beta_diversity
+from skbio.stats.distance import permanova
+import seaborn as sns
+from matplotlib.patches import Ellipse
+import matplotlib.gridspec as gridspec
+
+# -------------------- 数据准备 --------------------
+# 读取OTU表格（行是OTU，列是样本）
+genus_num = pd.read_table("~/work/PRJEB28545/temp/diversity/pro_votu_abundance.txt", index_col=0)
+# 或者使用相对丰度文件
+# genus_num = pd.read_table("~/work/PRJEB28545/temp/Gene_quant/pro_sorted_votu_abundance.txt", index_col=0).iloc[:, :-1]
+
+# 读取分组信息
+dfGroup = pd.read_table("~/work/PRJEB28545/temp/diversity/group.txt", 
+                       header=0).rename(columns={'run_accession': 'ID'})
+
+# -------------------- 计算Bray-Curtis距离 --------------------
+# 转置矩阵（skbio要求样本在行，OTU在列）
+otu_matrix = genus_num.T.values
+sample_ids = genus_num.columns
+bray_dist = beta_diversity("braycurtis", otu_matrix, ids=sample_ids)
+
+# 检查距离矩阵
+if (bray_dist.data < 0).any():
+    raise ValueError("Error: 距离矩阵包含负值，PCoA 计算无法进行！")
+if (bray_dist.data == 0).all():
+    raise ValueError("Error: 距离矩阵全为 0，无法计算 PCoA！")
+
+# -------------------- PCoA分析 --------------------
+pcoa_result = pcoa(bray_dist)
+pcoa_df = pd.DataFrame(pcoa_result.samples.values[:, :2], 
+                      columns=['Axis.1', 'Axis.2'],
+                      index=sample_ids).reset_index().rename(columns={'index': 'ID'})
+
+# 合并分组信息
+pcoa_df = pcoa_df.merge(dfGroup, on='ID').rename(columns={'experiment_title': 'Treatments'})
+
+# -------------------- PERMANOVA分析 --------------------
+permanova_result = permanova(bray_dist, pcoa_df['Treatments'], permutations=999)
+r_squared = permanova_result[5]
+p_value = permanova_result[6]
+permanova_label = f'PERMANOVA\nR^2={r_squared:.4f} p={p_value:.4f}'
+
+# -------------------- 绘图设置 --------------------
+# 颜色映射
+colors = {
+    'ankylosing spondylitis patient': '#d15b64',
+    'healthy people': '#73bbaf'
+}
+
+# -------------------- 主PCoA图 --------------------
+plt.figure(figsize=(10, 8))
+gs = gridspec.GridSpec(2, 2, width_ratios=[1, 4], height_ratios=[4, 1])
+
+# 主图
+ax_main = plt.subplot(gs[0, 1])
+sns.scatterplot(data=pcoa_df, x='Axis.1', y='Axis.2', hue='Treatments', 
+               palette=colors, ax=ax_main)
+
+# 添加椭圆
+for treatment in pcoa_df['Treatments'].unique():
+    group_data = pcoa_df[pcoa_df['Treatments'] == treatment]
+    cov = np.cov(group_data[['Axis.1', 'Axis.2']].T)
+    lambda_, v = np.linalg.eig(cov)
+    lambda_ = np.sqrt(lambda_)
+    ell = Ellipse(xy=(group_data['Axis.1'].mean(), group_data['Axis.2'].mean()),
+                  width=lambda_[0]*2*2, height=lambda_[1]*2*2,
+                  angle=np.degrees(np.arctan2(v[1, 0], v[0, 0])),
+                  edgecolor=colors[treatment], 
+                  facecolor='none', linewidth=0.8)
+    ax_main.add_patch(ell)
+
+ax_main.axhline(0, linestyle=':', color='grey60', linewidth=0.6)
+ax_main.axvline(0, linestyle=':', color='grey60', linewidth=0.6)
+ax_main.set_xlabel(f'PCoA1: {pcoa_result.proportion_explained[0]*100:.1f}%')
+ax_main.set_ylabel(f'PCoA2: {pcoa_result.proportion_explained[1]*100:.1f}%')
+ax_main.text(0.05, 0.95, permanova_label, transform=ax_main.transAxes,
+            ha='left', va='top', bbox=dict(facecolor='white', alpha=0.8))
+ax_main.legend().remove()
+
+# Y轴箱线图（左侧）
+ax_box_y = plt.subplot(gs[0, 0], sharey=ax_main)
+sns.boxplot(data=pcoa_df, y='Axis.2', x='Treatments', palette=colors, ax=ax_box_y, width=0.3)
+ax_box_y.set_xticklabels([])
+ax_box_y.set_xlabel('')
+ax_box_y.set_ylabel('')
+
+# X轴箱线图（下方）
+ax_box_x = plt.subplot(gs[1, 1], sharex=ax_main)
+sns.boxplot(data=pcoa_df, x='Axis.1', y='Treatments', palette=colors, ax=ax_box_x, width=0.3)
+ax_box_x.set_yticklabels([])
+ax_box_x.set_ylabel('')
+ax_box_x.set_xlabel('')
+
+plt.tight_layout()
+
+# 添加图例
+handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=colors[t], markersize=8)
+           for t in colors]
+legend = plt.figlegend(handles, colors.keys(), loc='lower center', 
+                      ncol=2, bbox_to_anchor=(0.5, -0.02))
+
+# 保存图片
+plt.savefig('~/work/PRJEB28545/temp/diversity/pcoa_abundance.pdf', 
+            bbox_extra_artists=(legend,), 
+            bbox_inches='tight',
+            dpi=300)
+plt.show()

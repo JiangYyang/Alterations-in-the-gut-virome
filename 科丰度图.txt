@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
+
+# -------------------- 第一部分：合并丰度和科注释 --------------------
+abundance_file = "~/work/PRJEB55711/temp/Gene_quant/merged_relative_abundance.txt"
+family_file = "~/work/PRJEB55711/temp/anno_nr_viral/up_parent_lineage.txt"
+output_file = "~/work/PRJEB55711/temp/Gene_quant/relative_abundance_with_family.txt"
+
+# 读取文件
+abundance_df = pd.read_csv(abundance_file, sep='\t')
+family_df = pd.read_csv(family_file, sep='\t')
+
+# 只保留 vOTU_ID 和 Family 列
+family_df = family_df[['vOTU_ID', 'Family']]
+
+# 合并数据
+merged_df = pd.merge(abundance_df, family_df, on='vOTU_ID', how='left')
+merged_df = merged_df[['vOTU_ID', 'Family'] + [col for col in merged_df.columns if col not in ['vOTU_ID', 'Family']]]
+
+# 保存结果
+merged_df.to_csv(output_file, sep='\t', index=False)
+print(f"结果已保存到: {output_file}")
+
+# -------------------- 第二部分：计算科水平丰度并绘图 --------------------
+input_file = "~/work/PRJEB55711/temp/Gene_quant/relative_abundance_with_family.txt"
+data = pd.read_csv(input_file, sep='\t').dropna(subset=['Family'])  # 过滤NA
+
+# 计算每列的总和
+column_sums = data.iloc[:, 2:].sum()
+
+# 转换为丰度值
+data_separated = data.iloc[:, 2:].div(column_sums)
+
+# 按Family分组求和
+data_aggregated = pd.concat([data['Family'], data_separated], axis=1) \
+                   .groupby('Family').sum().reset_index()
+
+# 保存结果
+data_aggregated.to_csv("~/work/PRJEB55711/temp/Gene_quant/family_abundance.txt", 
+                      sep='\t', index=False)
+
+# 计算总丰度并排序
+data_aggregated['TotalAbundance'] = data_aggregated.iloc[:, 1:].sum(axis=1)
+data_aggregated = data_aggregated.sort_values('TotalAbundance', ascending=False)
+
+# 选择前10个科，其余标记为Others
+top_10_family = data_aggregated.head(10)['Family'].tolist()
+data_aggregated['Family'] = np.where(
+    data_aggregated['Family'].isin(top_10_family),
+    data_aggregated['Family'],
+    'Others'
+)
+
+# 重新分组Others
+data_aggregated = data_aggregated.groupby('Family').sum().reset_index() \
+                                .sort_values('TotalAbundance', ascending=False)
+
+# 转换成长格式
+data_long = data_aggregated.melt(
+    id_vars='Family', 
+    var_name='Sample', 
+    value_name='Abundance'
+).query("Sample != 'TotalAbundance'")
+
+# 样本排序处理
+last_samples = [
+    "ERR10432648", "ERR10432682", "ERR10432693", "ERR10432701", "ERR10432731",
+    "ERR10432769", "ERR10432797", "ERR10432607", "ERR10432624", "ERR10432627",
+    "ERR10432631", "ERR10432663", "ERR10432668", "ERR10432676", "ERR10432711",
+    "ERR10432713", "ERR10432735", "ERR10432787", "ERR10432844", "ERR10432860",
+    "ERR10432869", "ERR10432602", "ERR10432637", "ERR10432651", "ERR10432673",
+    "ERR10432745", "ERR10432820", "ERR10432849"
+]
+
+all_samples = data_long['Sample'].unique()
+ordered_samples = [s for s in all_samples if s not in last_samples] + last_samples
+
+# 生成HSV颜色
+num_colors = len(data_aggregated)
+hsv_colors = [hsv_to_rgb((i/num_colors, 0.8, 0.8)) for i in range(num_colors)]
+
+# 绘图
+plt.figure(figsize=(15, 8))
+ax = plt.gca()
+
+# 样本顺序处理
+data_long['Sample'] = pd.Categorical(data_long['Sample'], categories=ordered_samples)
+data_long = data_long.sort_values('Sample')
+
+# Family顺序保持
+family_order = data_aggregated['Family'].tolist()
+data_long['Family'] = pd.Categorical(data_long['Family'], categories=family_order)
+
+# 堆叠图
+for i, family in enumerate(family_order):
+    subset = data_long[data_long['Family'] == family]
+    if i == 0:
+        bottom = np.zeros(len(ordered_samples))
+    else:
+        bottom = bottom + prev_values
+    
+    plt.bar(
+        x=range(len(ordered_samples)),
+        height=subset.groupby('Sample')['Abundance'].sum().reindex(ordered_samples).fillna(0),
+        bottom=bottom,
+        color=hsv_colors[i],
+        label=family
+    )
+    prev_values = subset.groupby('Sample')['Abundance'].sum().reindex(ordered_samples).fillna(0)
+
+# 调整坐标轴
+plt.xticks(range(len(ordered_samples)), 
+           labels=[s if s == "ERR2843546" else "" for s in ordered_samples],
+           rotation=45, ha='right')
+plt.ylabel("Relative Abundance (%)")
+plt.xlabel("")
+plt.legend(title="Family", bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()

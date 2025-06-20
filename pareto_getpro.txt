@@ -1,0 +1,90 @@
+#####python计算平均相对丰度，并且降序排列，绘制帕累托图，提取前xx条votu用于后续分析#####
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+#######———计算每个vOTU的平均相对丰度—————#####
+# 1. 定义输入和输出文件路径
+input_file = "~/work/PRJEB28545/temp/Gene_quant/merged_relative_abundance.txt"
+output_file = "~/work/PRJEB28545/temp/Gene_quant/sorted_votu_abundance.txt"
+
+# 2. 读取数据，假设是 tab 分隔的文件
+df = pd.read_csv(input_file, sep="\t")
+
+# 3. 计算每个 vOTU 的平均相对丰度，并保留列名
+df["Mean_Abundance"] = df.iloc[:, 1:].mean(axis=1)
+
+# 4. 按照平均相对丰度降序排序
+df_sorted = df.sort_values(by="Mean_Abundance", ascending=False)
+
+# 5. 保存排序后的结果，包括计算出的 "Mean_Abundance" 列
+#df_sorted.to_csv(output_file, sep="\t", index=False)
+#######————————#####
+
+
+#######———绘制帕累托图—————#####
+# 1. 读取数据,不保存df_sorted文件就执行1.1
+#input_file = "~/work/PRJEB28545/temp/Gene_quant/sorted_votu_abundance.txt"
+#df = pd.read_csv(input_file, sep="\t")
+#1.1转换数据框.
+df = df_sorted
+
+# 2. 选择 vOTU 名称和平均相对丰度列
+df = df[["vOTU_ID", "Mean_Abundance"]]
+
+# 3. 帕累托排序：按 "Mean_Abundance" 降序
+df = df.sort_values(by="Mean_Abundance", ascending=False).reset_index(drop=True)
+
+# 4. 计算累计百分比
+df["Cumulative_Percentage"] = df["Mean_Abundance"].cumsum() / df["Mean_Abundance"].sum() * 100
+
+# 5. 画图（仅累计曲线）
+fig, ax = plt.subplots(figsize=(12, 6))
+
+# 累计百分比曲线（改为黑色，线条更细）
+ax.plot(df.index, df["Cumulative_Percentage"], color="black", linestyle="-", linewidth=1.5)
+
+# 计算适当的 x 轴刻度间隔（比如 5000）
+max_index = len(df) - 1
+tick_interval = max(1, max_index // 10)  # 计算一个合适的间隔
+xticks = np.arange(0, max_index + tick_interval, tick_interval)
+
+ax.set_xticks(xticks)  # 设置刻度
+ax.set_xticklabels(xticks)  # 仅显示特定间隔的刻度标签
+ax.set_xlabel("The number of vOTUs", fontsize=12)  # 仅显示数量
+ax.set_ylabel("Cumulative Percentage (%)", fontsize=12, color="black")
+ax.tick_params(axis='y', labelcolor="black")
+
+# 添加 80% 和 99% 参考线
+ax.axhline(y=80, color="gray", linestyle="dashed", linewidth=1, label="80% Reference Line")
+ax.axhline(y=99, color="red", linestyle="dashed", linewidth=1, label="99% Reference Line")
+
+
+# 找到累计丰度达到 99% 的索引
+idx_99 = (df["Cumulative_Percentage"] >= 99).idxmax()
+idx_98 = (df["Cumulative_Percentage"] >= 98.6).idxmax()
+print(idx_98)
+
+# 添加 99% 交点的 x 轴参考线
+ax.axvline(x=idx_99, color="red", linestyle="dashed", linewidth=1)
+ax.text(idx_99, 5, f"{idx_99}", color="red", fontsize=12, ha="center", va="bottom")  # 标注 x 值
+
+# 添加 95% 交点的 x 轴参考线
+ax.axvline(x=idx_95, color="red", linestyle="dashed", linewidth=1)
+ax.text(idx_95, 5, f"{idx_95}", color="red", fontsize=12, ha="center", va="bottom")  # 标注 x 值
+
+# 设置标题
+plt.title("Pareto Curve of vOTU Mean Abundance", fontsize=14)
+plt.legend()
+plt.tight_layout()
+
+# 6. 保存图片
+plt.savefig("Gene_quant/pareto_votu_abundance_curve.png", dpi=300)
+
+
+#######———提取前xx条votu—————#####
+#df_selected = df_sorted.iloc[:19844, :-1] #去除最后一列Mean Abundance
+df_selected = df_sorted.iloc[:19844] #保留最后一列Mean Abundance
+output_path = "~/work/PRJEB28545/temp/Gene_quant/pro_sorted_votu_abundance.txt"
+df_selected.to_csv(output_path, sep="\t", index=False)
